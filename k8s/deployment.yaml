@@ -1,0 +1,811 @@
+# Complete Kubernetes Deployment for Agentic Multimodal RAG System
+# Namespace: RAG
+
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rag
+  labels:
+    name: rag
+
+---
+# ConfigMap for RAG System Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-config
+  namespace: rag
+data:
+  # Milvus Configuration
+  MILVUS_HOST: "10.43.52.126"
+  MILVUS_PORT: "19530"
+  MILVUS_COLLECTION_PREFIX: "rag_"
+  
+  # Neo4j Configuration (for Graphiti)
+  NEO4J_HOST: "neo4j-service.rag.svc.cluster.local"
+  NEO4J_PORT: "7687"
+  NEO4J_DATABASE: "neo4j"
+  
+  # API Configuration
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+  LOG_LEVEL: "INFO"
+  
+  # Model Configuration
+  EMBEDDING_MODEL: "sentence-transformers/all-MiniLM-L6-v2"
+  MULTIMODAL_MODEL: "openai/clip-vit-base-patch32"
+  LLM_MODEL: "gpt-4o-mini"
+  
+  # Agent Configuration
+  MAX_ITERATIONS: "10"
+  ENABLE_MULTIMODAL: "false"
+  ENABLE_GRAPH_REASONING: "true"
+
+---
+# Secret for sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rag-secrets
+  namespace: rag
+type: Opaque
+stringData:
+  # Neo4j Credentials
+  NEO4J_USERNAME: "neo4j"
+  NEO4J_PASSWORD: "changeme123"
+  
+  # OpenAI API Key (for LLM)
+  OPENAI_API_KEY: "your-openai-api-key-here"
+  
+  # Milvus Authentication (if needed)
+  MILVUS_USERNAME: ""
+  MILVUS_PASSWORD: ""
+  
+  # JWT Secret for API authentication
+  JWT_SECRET_KEY: "your-jwt-secret-key-here"
+
+---
+# Neo4j Deployment (for Graphiti)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo4j
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+      annotations:
+        k8tz.io/inject: "false"
+    spec:
+      containers:
+      - name: neo4j
+        image: neo4j:5.15-community
+        ports:
+        - containerPort: 7474
+          name: http
+        - containerPort: 7687
+          name: bolt
+        env:
+        - name: NEO4J_AUTH
+          value: "neo4j/changeme123"
+        - name: NEO4J_server_config_strict__validation_enabled
+          value: "false"
+        - name: NEO4J_dbms_default__listen__address
+          value: "0.0.0.0"
+        - name: NEO4J_dbms_connector_bolt_listen__address
+          value: "0.0.0.0:7687"
+        - name: NEO4J_dbms_connector_http_listen__address
+          value: "0.0.0.0:7474"
+        volumeMounts:
+        - name: neo4j-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+      volumes:
+      - name: neo4j-data
+        persistentVolumeClaim:
+          claimName: neo4j-pvc
+
+---
+# Neo4j PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neo4j-pvc
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# Neo4j Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j-service
+  namespace: rag
+spec:
+  selector:
+    app: neo4j
+  ports:
+  - name: http
+    port: 7474
+    targetPort: 7474
+  - name: bolt
+    port: 7687
+    targetPort: 7687
+
+---
+# Redis Deployment (for caching and session management)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        command:
+        - redis-server
+        - --appendonly
+        - "yes"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: redis-pvc
+
+---
+# Redis PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-pvc
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: rag
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# Milvus Deployment (for vector storage)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus
+  template:
+    metadata:
+      labels:
+        app: milvus
+    spec:
+      containers:
+      - name: milvus
+        image: milvusdb/milvus:v2.3.4
+        ports:
+        - containerPort: 19530
+          name: grpc
+        - containerPort: 9091
+          name: metrics
+        env:
+        - name: ETCD_ENDPOINTS
+          value: "http://10.43.25.209:2379"
+        - name: MINIO_ADDRESS
+          value: "10.43.115.177:9000"
+        command:
+        - milvus
+        - run
+        - standalone
+        volumeMounts:
+        - name: milvus-data
+          mountPath: /var/lib/milvus
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+      volumes:
+      - name: milvus-data
+        persistentVolumeClaim:
+          claimName: milvus-pvc
+
+---
+# Milvus PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: milvus-pvc
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# Milvus Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-service
+  namespace: rag
+spec:
+  selector:
+    app: milvus
+  ports:
+  - name: grpc
+    port: 19530
+    targetPort: 19530
+  - name: metrics
+    port: 9091
+    targetPort: 9091
+
+---
+# Etcd for Milvus
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      containers:
+      - name: etcd
+        image: quay.io/coreos/etcd:v3.5.5
+        ports:
+        - containerPort: 2379
+        - containerPort: 2380
+        env:
+        - name: ETCD_AUTO_COMPACTION_MODE
+          value: "revision"
+        - name: ETCD_AUTO_COMPACTION_RETENTION
+          value: "1000"
+        - name: ETCD_QUOTA_BACKEND_BYTES
+          value: "4294967296"
+        - name: ETCD_SNAPSHOT_COUNT
+          value: "50000"
+        command:
+        - /usr/local/bin/etcd
+        - --data-dir=/etcd-data
+        - --name=s1
+        - --initial-advertise-peer-urls=http://0.0.0.0:2380
+        - --listen-peer-urls=http://0.0.0.0:2380
+        - --advertise-client-urls=http://0.0.0.0:2379
+        - --listen-client-urls=http://0.0.0.0:2379
+        - --initial-cluster=s1=http://0.0.0.0:2380
+        - --initial-cluster-state=new
+        - --initial-cluster-token=etcd-cluster-1
+        volumeMounts:
+        - name: etcd-data
+          mountPath: /etcd-data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+      volumes:
+      - name: etcd-data
+        persistentVolumeClaim:
+          claimName: etcd-pvc
+
+---
+# Etcd PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: etcd-pvc
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# Etcd Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: rag
+spec:
+  selector:
+    app: etcd
+  ports:
+  - port: 2379
+    targetPort: 2379
+
+---
+# MinIO for Milvus
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+        ports:
+        - containerPort: 9000
+        - containerPort: 9001
+        env:
+        - name: MINIO_ACCESS_KEY
+          value: "minioadmin"
+        - name: MINIO_SECRET_KEY
+          value: "minioadmin"
+        command:
+        - /bin/bash
+        - -c
+        args:
+        - minio server /data --console-address ":9001"
+        volumeMounts:
+        - name: minio-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+      volumes:
+      - name: minio-data
+        persistentVolumeClaim:
+          claimName: minio-pvc
+
+---
+# MinIO PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# MinIO Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: rag
+spec:
+  selector:
+    app: minio
+  ports:
+  - name: api
+    port: 9000
+    targetPort: 9000
+  - name: console
+    port: 9001
+    targetPort: 9001
+
+---
+# RAG System Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-system
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-system
+  template:
+    metadata:
+      labels:
+        app: rag-system
+    spec:
+      containers:
+      - name: rag-api
+        image: docker.io/docker4zerocool/rag-system:v1749092895  # You'll need to build and push this image
+        ports:
+        - containerPort: 8000
+        env:
+        # Milvus Configuration
+        - name: MILVUS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: MILVUS_HOST
+        - name: MILVUS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: MILVUS_PORT
+        - name: MILVUS_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: rag-secrets
+              key: MILVUS_USERNAME
+        - name: MILVUS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rag-secrets
+              key: MILVUS_PASSWORD
+        
+        # Neo4j Configuration
+        - name: NEO4J_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: NEO4J_HOST
+        - name: NEO4J_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: NEO4J_PORT
+        - name: NEO4J_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: rag-secrets
+              key: NEO4J_USERNAME
+        - name: NEO4J_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rag-secrets
+              key: NEO4J_PASSWORD
+        
+        # Redis Configuration
+        - name: REDIS_HOST
+          value: "redis-service.rag.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        
+        # API Keys
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rag-secrets
+              key: OPENAI_API_KEY
+        - name: JWT_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rag-secrets
+              key: JWT_SECRET_KEY
+        
+        # Other Configuration
+        - name: API_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: API_HOST
+        - name: API_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: API_PORT
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: LOG_LEVEL
+        - name: EMBEDDING_MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: EMBEDDING_MODEL
+        - name: MULTIMODAL_MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: MULTIMODAL_MODEL
+        - name: LLM_MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: LLM_MODEL
+        - name: MAX_ITERATIONS
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: MAX_ITERATIONS
+        - name: ENABLE_MULTIMODAL
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: ENABLE_MULTIMODAL
+        - name: ENABLE_GRAPH_REASONING
+          valueFrom:
+            configMapKeyRef:
+              name: rag-config
+              key: ENABLE_GRAPH_REASONING
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+        
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/models
+        - name: temp-storage
+          mountPath: /tmp
+      
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache-pvc
+      - name: temp-storage
+        emptyDir: {}
+
+---
+# Model Cache PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache-pvc
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# RAG System Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service
+  namespace: rag
+spec:
+  selector:
+    app: rag-system
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+  type: ClusterIP
+
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-ingress
+  namespace: rag
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  rules:
+  - host: rag.askcollections.com  # Replace with your domain
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rag-service
+            port:
+              number: 80
+
+---
+# HorizontalPodAutoscaler for auto-scaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-hpa
+  namespace: rag
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rag-system
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# Network Policy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rag-network-policy
+  namespace: rag
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8000
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 6379  # Redis
+    - protocol: TCP
+      port: 7687  # Neo4j
+    - protocol: TCP
+      port: 7474  # Neo4j HTTP
+  egress:
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443  # HTTPS
+    - protocol: TCP
+      port: 80   # HTTP
+    - protocol: TCP
+      port: 19530 # Milvus
+  - to:
+    - podSelector: {}
+
+---
+# ServiceMonitor for Prometheus monitoring (optional)
+# apiVersion: monitoring.coreos.com/v1
+# kind: ServiceMonitor
+# metadata:
+#   name: rag-service-monitor
+#   namespace: rag
+# spec:
+#   selector:
+#     matchLabels:
+#       app: rag-system
+#   endpoints:
+#   - port: "8000"
+#     path: /metrics
+#     interval: 30s
+
+---
+# RBAC - ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-service-account
+  namespace: rag
+
+---
+# RBAC - Role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rag-role
+  namespace: rag
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+
+---
+# RBAC - RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rag-role-binding
+  namespace: rag
+subjects:
+- kind: ServiceAccount
+  name: rag-service-account
+  namespace: rag
+roleRef:
+  kind: Role
+  name: rag-role
+  apiGroup: rbac.authorization.k8s.io
